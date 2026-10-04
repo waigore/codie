@@ -1,0 +1,141 @@
+# THE transition table + per-role mutation matrix (Technical Spec §5.5) — data.
+#
+# Loaded by the kernel (reconciliation) and by every role's label/github tools.
+# A tool call naming an edge outside its matrix row is refused by the kernel.
+#
+# `from: null` means the entry edge (creation). `caps: ~` on a row means that
+# row's `from` is any non-terminal status. Actors: kernel | planner | coder |
+# reviewer | tester | human.
+
+feature_transitions:
+  - from: null
+    to: proposed
+    trigger: "feature created from validated FeatureIssueDraft"
+    actors: [kernel]
+  - from: proposed
+    to: speccing
+    trigger: "DraftSpecs dispatched"
+    actors: [kernel]
+  - from: speccing
+    to: spec-review
+    trigger: "spec PR open and ready-for-review (not draft)"
+    actors: [kernel]
+  - from: spec-review
+    to: speccing
+    trigger: "spec PR changes-requested (human or Reviewer)"
+    actors: [kernel]
+  - from: spec-review
+    to: specified
+    trigger: "spec PR merged (requires Reviewer's APPROVED on current head — Reviewer-side gate)"
+    actors: [kernel]
+  - from: specified
+    to: planned
+    trigger: "validated TaskBreakdown applied"
+    actors: [kernel]
+  - from: planned
+    to: in-progress
+    trigger: "any child task leaves backlog (from current labels)"
+    actors: [kernel]
+  - from: in-progress
+    to: review
+    trigger: "acceptance run passed"
+    actors: [tester]
+  - from: review
+    to: accepted
+    trigger: "human label flip (UAT) — detected, never written by the kernel"
+    actors: [human]
+  - from: review
+    to: revised
+    trigger: "human label flip (UAT) — detected, never written by the kernel"
+    actors: [human]
+  - from: revised
+    to: speccing
+    trigger: "codie:revision requirements marker -> cancel non-terminal children, close PRs, re-spec"
+    actors: [kernel]
+  - from: revised
+    to: planned
+    trigger: "codie:revision implementation marker -> ReplanResult validated and applied"
+    actors: [kernel]
+  - from: any
+    to: cancelled
+    trigger: "validated Planner cancellation"
+    actors: [kernel]
+
+task_transitions:
+  - from: null
+    to: [backlog, ready]
+    trigger: "created (unmet deps -> backlog; else ready) — kernel (tasks, for Planner) / Tester (bugs)"
+    actors: [kernel, tester]
+  - from: backlog
+    to: ready
+    trigger: "all dependencies satisfied (done or cancelled), no flag:blocked"
+    actors: [kernel]
+  - from: ready
+    to: in-progress
+    trigger: "claim (assign + label) — Coder for dev/integration/bug, Tester for kind:test"
+    actors: [coder, tester]
+  - from: in-progress
+    to: in-review
+    trigger: "PR opened — Coder, or Tester for kind:test"
+    actors: [coder, tester]
+  - from: in-review
+    to: in-progress
+    trigger: "review changes requested"
+    actors: [reviewer]
+  - from: in-review
+    to: done
+    trigger: "PR merged (task)"
+    actors: [reviewer]
+  - from: in-review
+    to: verifying
+    trigger: "fix PR merged (bug)"
+    actors: [reviewer]
+  - from: verifying
+    to: done
+    trigger: "re-verification passes"
+    actors: [tester]
+  - from: verifying
+    to: in-progress
+    trigger: "re-verification fails (cycle counter increments)"
+    actors: [tester]
+  - from: in-progress
+    to: ready
+    trigger: "stale-run recovery only (heartbeat timeout)"
+    actors: [kernel]
+  - from: any
+    to: cancelled
+    trigger: "validated Planner cancellation; open linked PR is closed with explanatory comment"
+    actors: [kernel]
+
+# Per-role mutation matrix (Product Spec §6 / Technical Spec §5.5).
+mutation_matrix:
+  planner:
+    labels: []
+    issues: []
+    prs: ["create_spec_pr", "update_spec_pr"]
+    files: ["specs/<issue#>-<slug>/**"]
+  coder:
+    labels: ["claim task", "in-progress <-> in-review", "flag:blocked on its active-run issue only"]
+    issues: ["claim", "comment"]
+    prs: ["create task PR", "update task PR"]
+    files: ["workspace except specs/**, acceptance.dir, and policy files"]
+  reviewer:
+    labels: ["in-review -> in-progress", "in-review -> done/verifying"]
+    issues: ["comment"]
+    prs: ["review", "merge task PR", "merge spec PR after own approval on head", "close"]
+    files: []
+  tester:
+    labels: ["claim test task", "in-progress <-> in-review", "verifying -> done/in-progress", "flag:blocked on its active-run issue only"]
+    issues: ["create bugs", "comment", "PRD checklist check-off"]
+    prs: ["create test PR", "update test PR"]
+    files: ["acceptance.dir + test artifacts"]
+  kernel:
+    labels: ["all matrix edges", "flag:needs-human"]
+    issues: ["create/comment/edit per validated role output", "escalation + heartbeat comments", "close/reopen terminal-status issues"]
+    prs: ["open release PR", "close cancelled-task PRs"]
+    files: []
+  human:
+    labels: ["any"]
+    issues: ["any"]
+    prs: ["any"]
+    files: ["any"]

@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codie"
+version = "0.4.2"
+description = "Codie — an autonomous software-development crew built on CrewAI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Codie contributors" }]
+dependencies = [
+    "crewai>=0.86.0",
+    "crewai-tools>=0.22.0",
+    "litellm>=1.50.0",
+    "PyGithub>=2.4.0",
+    "pydantic>=2.7,<3",
+    "PyYAML>=6.0",
+    "typer>=0.12",
+    "tenacity>=8.2",
+    "structlog>=24.1",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "sse-starlette>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-mock>=3.14",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.scripts]
+codie = "codie.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codie"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 119
+extend-exclude = ["docs/**", "AGENTS.md"]
+src = ["src"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008", "UP035"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = false
+warn_unused_ignores = false
+follow_imports = "normal"
+
+[[tool.mypy.overrides]]
+module = ["crewai.*", "github.*", "typer.*", "tenacity.*", "fastapi.*", "uvicorn.*", "sse_starlette.*"]
+ignore_missing_imports = true

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>codie dashboard</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+  header { padding: 12px 20px; border-bottom: 1px solid #2a2f3a; display: flex; gap: 24px; align-items: baseline; }
+  header h1 { font-size: 18px; margin: 0; }
+  #agents { padding: 16px 20px; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  .agent { border: 1px solid #2a2f3a; border-radius: 8px; padding: 12px; }
+  .agent h3 { margin: 0 0 6px; font-size: 15px; }
+  .agent .state { font-size: 12px; color: #8ab4f8; }
+  .toggle { float: right; }
+  #logs { margin: 16px 20px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; max-height: 50vh; overflow: auto; border: 1px solid #2a2f3a; border-radius: 8px; padding: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>codie — agent dashboard</h1>
+  <span id="summary">loading…</span>
+</header>
+<div id="agents">loading…</div>
+<div id="logs">waiting for events…</div>
+<script src="/app.js"></script>
+</body>
+</html>
