@@ -74,6 +74,63 @@ def test_toggle_reflected_in_dispatch_gate(tmp_path):
 
     state = derive(fetch_snapshot(gh, settings.project.repo, settings, full=True), settings)
     kernel._current_queue = [item]
-    outcome = kernel.dispatch_work_item(item, state, force=False)
+    outcome = kernel.dispatch_work_item(item, state)
     assert outcome.status == "refused"
     assert "disabled" in outcome.error
+
+
+def test_summary_reads_real_kernel_state(tmp_path):
+    """I-23: /api/summary reflects the kernel's halt/pause state, not hardcoded values."""
+    from tests.conftest import add_prd, fresh_fake, make_settings
+
+    gh = fresh_fake()
+    add_prd(gh)
+    cache = Cache().open_or_rebuild(tmp_path / "s.db")
+    settings = make_settings()
+    settings.project.repo = "acme/test"
+    from codie.dispatch import StubRunner
+    from codie.orchestrator import Kernel
+
+    kernel = Kernel(settings=settings, client=gh, cache=cache, crew_runner=StubRunner(lambda r, i, p: "{}"))
+    outcome = kernel.cycle()
+    outcome.halted = True
+    kernel._last_outcome = outcome
+    kernel.start_time = kernel.start_time - __import__("datetime").timedelta(seconds=90)
+    app = create_app(cache, roster=Roster(), kernel=kernel)
+    client = TestClient(app)
+    summary = client.get("/api/summary").json()
+    assert summary["repo"] == "acme/test"
+    assert summary["halted"] is True
+    assert summary["uptime"] == "90s"  # real uptime, not a hardcoded string
+
+
+def test_stream_delivers_events(tmp_path):
+    """I-23: /api/stream delivers a dispatch event and roster changes (SSE)."""
+    import asyncio
+
+    from codie.dashboard.server import iter_sse
+
+    cache = Cache().open_or_rebuild(tmp_path / "st.db")
+    roster = Roster()
+    roster.begin("coder", "Implement #9", run_id="coder-9-1")
+    cache.add_event("coder", "dispatched Implement", kind="dispatch")
+
+    async def collect():
+        chunks = []
+        async for chunk in iter_sse(cache, roster, max_chunks=3):
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(collect())
+    joined = "\n".join(chunks)
+    assert "dispatched Implement" in joined  # the dispatch event reached the wire
+    assert '"type": "roster"' in joined or "roster" in joined
+
+
+def _stream_client(tmp_path):
+    from fastapi.testclient import TestClient
+
+    cache = Cache().open_or_rebuild(tmp_path / "st.db")
+    roster = Roster()
+    app = create_app(cache, roster=roster)
+    return TestClient(app)

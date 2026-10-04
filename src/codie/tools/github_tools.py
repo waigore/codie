@@ -152,9 +152,35 @@ class GithubToolbox:
         return labels
 
 
-def build_orchestrator_tools(client: GitHubClient, settings: Settings):
-    """The Orchestrator agent's tool surface (§6.1 table) returned as plain funcs."""
-    toolbox = GithubToolbox(client, settings, "kernel")
+def build_orchestrator_tools(bridge=None, client=None, settings: Settings | None = None):
+    """The Orchestrator agent's tool surface (§6.1 table) returned as plain funcs.
+
+    When `bridge` (an `OrchestratorBridge`) is given, its kernel-gated methods are
+    returned directly. The legacy client-based stubs are retained only as a
+    refuse-by-default fallback so misuse of the toolbox never mutates GitHub.
+    """
+    if bridge is not None:
+        return {
+            "get_project_state": bridge.get_project_state,
+            "compute_work_queue": bridge.compute_work_queue,
+            "dispatch_work_item": bridge.dispatch_work_item,
+            "defer_work_item": bridge.defer_work_item,
+            "apply_adoption": bridge.apply_adoption,
+            "escalate_to_human": bridge.escalate_to_human,
+            "annotate": bridge.annotate,
+            "get_conventions": bridge.get_conventions,
+            "get_budgets": bridge.get_budgets,
+            "get_run_history": bridge.get_run_history,
+        }
+    toolbox = GithubToolbox(client, settings, "kernel") if (client is not None and settings is not None) else None
+
+    def refusals():
+        twice = dict.fromkeys(("get_project_state", "get_run_history"), "no bridge")
+
+        def fn():
+            return twice
+
+        return fn
 
     def get_project_state() -> dict:
         return {"note": "see kernel-computed state; use compute_work_queue"}
@@ -181,6 +207,8 @@ def build_orchestrator_tools(client: GitHubClient, settings: Settings):
         return {"status": "refused", "reason": "escalation is kernel-mutating"}
 
     def annotate(issue: int, comment: str) -> dict:
+        if toolbox is None:
+            return {"status": "refused", "reason": "no client bound"}
         toolbox.comment(issue, comment)
         return {"status": "ok"}
 

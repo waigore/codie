@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS poll_state (
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_key TEXT UNIQUE,
     work_item_json TEXT NOT NULL,
     status TEXT NOT NULL,
     cost_usd REAL NOT NULL DEFAULT 0,
@@ -200,6 +201,48 @@ class Cache:
         )
         self.conn.commit()
         return int(cur.lastrowid or 0)
+
+    def begin_run(self, run_key: str, work_item: str, started_at: str | None = None) -> None:
+        """Record that a run handle started (§5.8 run table)."""
+        assert self.conn is not None
+        self.conn.execute(
+            (
+                "INSERT INTO runs(run_key, work_item_json, status, started_at) VALUES (?, ?, 'started', ?) "
+                "ON CONFLICT(run_key) DO UPDATE SET status='started'"
+            ),
+            (run_key, work_item, started_at or now_iso()),
+        )
+        self.conn.commit()
+
+    def complete_run(
+        self,
+        run_key: str,
+        status: str,
+        cost_usd: float = 0.0,
+        tokens: dict | None = None,
+        finished_at: str | None = None,
+        trace_path: str | None = None,
+    ) -> None:
+        assert self.conn is not None
+        tokens = tokens or {}
+        self.conn.execute(
+            (
+                "UPDATE runs SET status = ?, cost_usd = ?, tokens = ?, finished_at = COALESCE(?, finished_at), "
+                "trace_path = ? WHERE run_key = ?"
+            ),
+            (status, cost_usd, json.dumps(tokens), finished_at or now_iso(), trace_path, run_key),
+        )
+        self.conn.commit()
+
+    def get_run(self, run_key: str) -> dict | None:
+        assert self.conn is not None
+        row = self.conn.execute("SELECT * FROM runs WHERE run_key = ?", (run_key,)).fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in self.conn.execute("SELECT * FROM runs LIMIT 0").description]
+        d = dict(zip(cols, row, strict=False))
+        d["tokens"] = json.loads(d["tokens"] or "{}")
+        return d
 
     def finish_run(
         self,

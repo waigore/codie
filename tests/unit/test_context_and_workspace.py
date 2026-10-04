@@ -113,3 +113,28 @@ def test_workspace_clone_branch_commit(tmp_path):
     ws.commit_all("feat: add (3)")
     log = ws.git("log", "-1", "--pretty=%s").stdout.strip()
     assert log == "feat: add (3)"
+
+
+def test_worktree_lock_serializes_runs(tmp_path):
+    """I-15: a per-worktree lock serializes concurrent runs; a second holder is refused."""
+    from codie.workspace import WorkspaceLock
+
+    ws = Workspace(tmp_path, make_settings())
+    lock_path = ws.path / "wt" / "coder-run-1.lock"
+    lock = ws.worktree_lock("coder", "run-1")
+    second = WorkspaceLock(lock_path)
+    assert second.acquire(blocking=False) is False  # already held
+    lock.release()
+    again = WorkspaceLock(lock_path)
+    assert again.acquire(blocking=False) is True  # free after release
+    again.release()
+
+
+def test_workspace_push_never_calls_pull_rebase():
+    """I-15: the retry path must not contain a rebase invocation."""
+    import inspect
+
+    from codie import workspace as ws
+
+    source = inspect.getsource(ws.Workspace.push)
+    assert "rebase" not in source.lower()

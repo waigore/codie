@@ -21,10 +21,12 @@ from codie.cache import Cache
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
-def create_app(cache: Cache, roster=None, token: str | None = None) -> FastAPI:
+def create_app(cache: Cache, roster=None, token: str | None = None, kernel=None) -> FastAPI:
     app = FastAPI(title="codie dashboard", docs_url=None, redoc_url=None)
     app.state.cache = cache
     app.state.roster = roster
+    app.state.kernel = kernel
+    app.state.started_at = asyncio.get_event_loop().time() if kernel is None else 0.0
 
     def _auth(request: Request):
         if token and request.url.hostname not in {"127.0.0.1", "::1", "localhost"}:
@@ -41,6 +43,15 @@ def create_app(cache: Cache, roster=None, token: str | None = None) -> FastAPI:
     @app.get("/api/summary")
     def summary(request: Request):
         _auth(request)
+        if kernel is not None:
+            state = kernel.summary_state
+            return {
+                "repo": state["repo"],
+                "uptime": state["uptime"],
+                "daily_cost_usd": state["daily_cost_usd"],
+                "halted": state["halted"],
+                "paused": state["paused"],
+            }
         today = cache.today_cost()
         return {
             "repo": getattr(roster, "repo", ""),
@@ -87,20 +98,31 @@ def create_app(cache: Cache, roster=None, token: str | None = None) -> FastAPI:
         _auth(request)
         if token and request.url.hostname not in {"127.0.0.1", "::1", "localhost"}:
             raise HTTPException(status_code=401, detail="unauthorized")
-
-        async def gen():
-            seen = cache.conn and getattr(cache, "_last_event_id", 0) or 0  # type: ignore[union-attr]
-            while True:
-                rows = cache.list_events(after_id=seen, limit=50)
-                for row in reversed(rows):
-                    seen = row["id"]
-                    yield f"data: {json.dumps({'type': 'event', **row})}\n\n"
-                cache._last_event_id = seen  # type: ignore[attr-defined]
-                await asyncio.sleep(2.0)
-
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        return StreamingResponse(iter_sse(cache, roster), media_type="text/event-stream")
 
     return app
+
+
+async def iter_sse(cache: Cache, roster=None, max_chunks: int | None = None):
+    """SSE chunk generator: agent events + roster changes (I-23)."""
+    seen = 0
+    if cache.conn is not None:
+        seen = getattr(cache, "_last_event_id", 0) or 0
+    last_roster = ""
+    id_ = 0
+    while max_chunks is None or id_ < max_chunks:
+        id_ += 1
+        rows = cache.list_events(after_id=seen, limit=50)
+        for row in reversed(rows):
+            seen = row["id"]
+            yield f"data: {json.dumps({'type': 'event', **row})}\n\n"
+        cache._last_event_id = seen  # type: ignore[attr-defined]
+        if roster is not None:
+            current = json.dumps(roster.as_dicts(), sort_keys=True)
+            if current != last_roster:
+                last_roster = current
+                yield f"data: {json.dumps({'type': 'roster', 'agents': roster.as_dicts()})}\n\n"
+        await asyncio.sleep(0.1)
 
 
 def serve(cache: Cache, roster=None, host: str = "127.0.0.1", port: int = 8640, token: str | None = None):

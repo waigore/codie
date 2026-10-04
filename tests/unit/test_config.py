@@ -131,3 +131,21 @@ def test_settings_build_merges_project():
     )
     assert settings.project.repo == "a/b"
     assert settings.overrides.command("setup") == ["x"]
+
+
+def test_ci_declares_schedule_trigger_for_e2e(tmp_path):
+    """I-29: the e2e job is reachable — the workflow must declare a schedule trigger."""
+    from pathlib import Path
+
+    import yaml as _yaml
+
+    repo_root = Path(__file__).resolve().parents[2]
+    raw = (repo_root / ".github" / "workflows" / "ci.yml").read_text()
+    cfg = _yaml.safe_load(raw)
+    # `on:` is a YAML 1.1 boolean in PyYAML; assert on the raw text instead.
+    assert "schedule:" in raw, "ci.yml must declare a schedule so the e2e job can run (I-29)"
+    assert "e2e:" in raw or "e2e" in cfg.get("jobs", {})
+    jobs = cfg.get("jobs", {})
+    assert "quality" in jobs  # quality gate exists
+    if isinstance(cfg.get("on"), str):
+        pass  # nothing to check here

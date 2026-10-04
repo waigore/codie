@@ -1,16 +1,19 @@
 """Repo survey — phase 1 of `codie init` (Technical Spec §9.6).
 
 The production path uses the Surveyor crew (roles/surveyor.py, structured
-`RepoSurvey`); the deterministic `gather_survey` below supplies the mechanical
-passthrough that provisioning tests and `--yes`/`--pr` flows rely on.
+`RepoSurvey`); `gather_survey` below is the deterministic, evidence-gathering
+implementation every path relies on (provisioning tests and `--yes`/`--pr`
+flows included). Findings carry file-path/history evidence and source tags.
 """
 
 from __future__ import annotations
 
+import json
+
 from codie.config import Settings
 from codie.github.client import GitHubClient
-from codie.models import Finding, IssueTriage, PrdProposal, RepoSurvey
-from codie.state import parse
+from codie.models import Finding, RepoSurvey
+from codie.roles import surveyor as surveyor_role
 
 
 def gather_survey(
@@ -20,79 +23,35 @@ def gather_survey(
     workspace=None,
     max_open_issues: int | None = None,
 ) -> RepoSurvey:
-    """Deterministic, read-only survey of branching, issues, and PRD candidate."""
+    """Deterministic, read-only survey of branching, issues, toolchain, and PRD."""
     max_open_issues = max_open_issues or settings.survey.max_open_issues
     dimensions: dict[str, Finding] = {}
 
-    # branching
-    main = client.get_ref(settings.branches.main)
-    dev = client.get_ref(settings.branches.dev)
-    branches_evidence: list[str] = []
-    if main is not None:
-        branches_evidence.append(f"branch {settings.branches.main} exists ({main[:8]})")
-    if dev is not None:
-        branches_evidence.append(f"branch {settings.branches.dev} exists ({dev[:8]})")
-    if not dev:
-        dimensions["branches"] = Finding(
-            value="uses opinionated defaults (main/dev; this repo has no dev branch yet)",
-            confidence="high",
-            source="default",
-            evidence=branches_evidence or ["no integration branch found"],
-        )
-    else:
-        dimensions["branches"] = Finding(
-            value=f"main={settings.branches.main}, dev={settings.branches.dev}",
-            confidence="high",
-            source="adopted",
-            evidence=branches_evidence,
-        )
+    # -- branching: detect the real names (master/develop, not just main/dev)
+    detected_main, detected_dev = _detect_branches(client, settings)
+    actual_dev = client.get_ref(detected_dev) if detected_dev else None
+    dimensions["branches"] = surveyor_role.infer_branch_dimension(
+        client, settings, settings.branches.main, settings.branches.dev
+    )
 
-    # PRs / merge style
-    prs = client.list_prs()
-    merged_prs = [pr for pr in prs if pr.state == "merged"]
+    # -- merge style / PR norms
+    merged_prs = [p for p in client.list_prs() if p.state == "merged"]
+    dimensions["merge_style"] = surveyor_role.infer_commit_norms(client, settings)
     if merged_prs:
-        dimensions["merge_style"] = Finding(
-            value="merge via pull requests (merged PR history found)",
-            confidence="high",
+        dimensions["pr_norms"] = Finding(
+            value="PRs carry requested reviewers / checks",
             source="adopted",
+            confidence="medium",
             evidence=[f"merged PR #{p.number} {p.title}" for p in merged_prs[:5]],
         )
-    else:
-        dimensions["merge_style"] = Finding(
-            value="squash (default)", source="default", evidence=["no merged PR history"]
-        )
 
-    # issues / triage
+    # -- issues / triage
     open_issues = sorted(
         (i for i in client.list_issues() if i.state == "open"),
         key=lambda i: i.updated_at,
         reverse=True,
     )[:max_open_issues]
-    triage: list[IssueTriage] = []
-    for issue in open_issues:
-        t = parse.type_of(issue.labels)
-        if t is not None:
-            continue  # already typed
-        proposed = _propose_type(issue.title, issue.body)
-        if proposed == "untyped":
-            triage.append(
-                IssueTriage(
-                    number=issue.number,
-                    proposed_type="untyped",
-                    rationale="question/discussion; out of crew scope",
-                    confidence="medium",
-                )
-            )
-        else:
-            triage.append(
-                IssueTriage(
-                    number=issue.number,
-                    proposed_type=proposed,  # type: ignore[arg-type]
-                    proposed_status="ready" if proposed in {"task", "bug"} else "proposed",
-                    rationale=_rationale(issue.title),
-                    confidence="low",
-                )
-            )
+    triage = [surveyor_role.triage_issue(issue) for issue in open_issues]
     if open_issues:
         dimensions["issues"] = Finding(
             value=f"triaged {len(triage)} open issue(s) for adoption",
@@ -101,11 +60,33 @@ def gather_survey(
             evidence=[f"#{i.number} {i.title}" for i in open_issues[:10]],
         )
 
-    # PRD discovery (§9.6)
-    prd = _discover_prd(client, settings, repo)
+    # -- label habits → label_mapping (M24)
+    label_dim = surveyor_role.infer_label_habits(client, settings, actual_dev)
+    dimensions["label_habits"] = label_dim
 
-    # commands / surface (best-effort from repo files)
-    commands, surface, framework = _infer_toolchain(client, settings)
+    # -- commands / surface (evidence-linked findings)
+    commands, surface, framework, cmd_evidence = _infer_toolchain(client, settings, actual_dev)
+    dimensions["commands"] = Finding(
+        value=json.dumps(commands, sort_keys=True),
+        confidence="medium",
+        source="adopted" if commands else "default",
+        evidence=cmd_evidence or ["no CI/manifest evidence — defaults apply"],
+    )
+    dimensions["surface"] = Finding(
+        value=surface,
+        confidence="medium",
+        source="adopted",
+        evidence=cmd_evidence or ["inferred from stack (default: cli)"],
+    )
+    dimensions["acceptance_framework"] = Finding(
+        value=framework,
+        confidence="medium",
+        source="adopted" if framework != "subprocess" else "default",
+        evidence=["surface/stack default"],
+    )
+
+    # -- PRD discovery
+    prd = _discover_prd(client, settings, actual_dev)
 
     return RepoSurvey(
         dimensions=dimensions,
@@ -114,61 +95,62 @@ def gather_survey(
     )
 
 
-def _propose_type(title: str, body: str) -> str:
-    text = f"{title}\n{body}".lower()
-    if any(w in text for w in ["bug", "broken", "fails", "error", "crash", "regression"]):
-        return "bug"
-    if any(w in text for w in ["feature", "add ", "new ", "support", "ability to"]):
-        return "feature"
-    if any(w in text for w in ["?", "discussion", "proposal", "question"]):
-        return "untyped"
-    return "untyped"
+def _detect_branches(client: GitHubClient, settings: Settings) -> tuple[str, str]:
+    """Return (actual_main, actual_dev) resolving master/develop aliases (I-02)."""
+    main_names = [settings.branches.main] + [n for n in ("main", "master") if n != settings.branches.main]
+    dev_names = [settings.branches.dev] + [n for n in ("dev", "develop") if n != settings.branches.dev]
+    actual_main = next((n for n in main_names if client.get_ref(n)), settings.branches.main)
+    actual_dev = next((n for n in dev_names if client.get_ref(n) and n != actual_main), settings.branches.dev)
+    if not client.get_ref(actual_dev) and not client.get_ref(actual_main):
+        return settings.branches.main, settings.branches.dev
+    return actual_main, actual_dev
 
 
-def _rationale(title: str) -> str:
-    return f"adopted from existing issue titled {title!r}"
+def survey_commands(survey: RepoSurvey) -> dict[str, list[str]]:
+    finding = survey.dimensions.get("commands")
+    if finding is None:
+        return {}
+    try:
+        data = json.loads(finding.value)
+        return {k: v for k, v in data.items() if isinstance(v, list)}
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
-def _discover_prd(client: GitHubClient, settings: Settings, repo: str) -> PrdProposal:
-    dev = client.get_ref(settings.branches.dev)
+def apply_dimension_edits(survey: RepoSurvey, edits: dict[str, str]) -> RepoSurvey:
+    """Phase-2 per-dimension edits (I-03): each edit touches only that dimension."""
+    for dim, value in edits.items():
+        finding = survey.dimensions.get(dim)
+        if finding is None or not value:
+            continue
+        finding.value = value
+        finding.source = "adopted"
+    return survey
+
+
+def survey_surface(survey: RepoSurvey) -> tuple[str, str]:
+    surface = survey.dimensions.get("surface")
+    framework = survey.dimensions.get("acceptance_framework")
+    return (surface.value if surface else "cli"), (framework.value if framework else "subprocess")
+
+
+def _discover_prd(client: GitHubClient, settings: Settings, dev: str | None):
     if dev is None:
+        from codie.models import PrdProposal
+
         return PrdProposal(source="none", evidence=["no integration branch — fresh repo"])
+    from codie.roles.surveyor import infer_prd
 
-    for path in ("PRD.md", "docs/PRD.md", "docs/prd.md", "README.md"):
-        content = client.get_file(path, dev)
-        if content and ("## Definition of done" in content or "- [ ] E1:" in content or "evals" in content.lower()):
-            return PrdProposal(source="adopted_doc", content=content, evidence=[f"{path} at {dev[:8]}"])
-    # requirements docs
-    for path in ("docs/requirements.md", "docs/requirements/", "docs/requirements/index.md"):
-        content = client.get_file(path, dev)
-        if content:
-            return PrdProposal(source="adopted_doc", content=content, evidence=[path])
-    readme = client.get_file("README.md", dev)
-    if readme:
-        return PrdProposal(
-            source="synthesized",
-            content=_synthesize_prd(readme),
-            evidence=["README.md goals section"],
-        )
-    return PrdProposal(source="none", evidence=["no requirements document found"])
+    return infer_prd(client, settings, dev)
 
 
-def _synthesize_prd(readme: str) -> str:
-    return (
-        "# PRD (synthesized — please review)\n\n"
-        f"## Product\n{readme[:2000]}\n\n"
-        "## Definition of done\n- [ ] E1: the primary user journey works end-to-end\n"
-    )
-
-
-def _infer_toolchain(client: GitHubClient, settings: Settings) -> tuple[dict[str, list[str]], str, str]:
-    dev = client.get_ref(settings.branches.dev)
+def _infer_toolchain(client, settings: Settings, dev) -> tuple[dict[str, list[str]], str, str, list[str]]:
     commands: dict[str, list[str]] = {}
     surface = "cli"
     framework = "subprocess"
+    evidence: list[str] = []
     if dev is None:
-        return commands, surface, framework
-    # Surface from manifests
+        return commands, surface, framework, evidence
     for path, surf in (
         ("package.json", "ui-web"),
         ("pubspec.yaml", "ui-mobile"),
@@ -177,21 +159,39 @@ def _infer_toolchain(client: GitHubClient, settings: Settings) -> tuple[dict[str
     ):
         content = client.get_file(path, dev)
         if content:
-            surface = (
-                "ui-web" if (surf == "ui-web" and ("react" in content.lower() or "vue" in content.lower())) else surf
-            )
+            if surf == "ui-web" and any(x in content.lower() for x in ("react", "vue", "svelte")):
+                surface = "ui-web"
+            else:
+                surface = surf
+            evidence.append(f"{path} on {dev[:8]}")
             break
-    # Commands from CI best-effort
     for path in (".github/workflows/ci.yml", ".gitlab-ci.yml"):
         ci = client.get_file(path, dev)
-        if ci:  # noqa: SIM102
+        if ci:
+            evidence.append(f"{path} on {dev[:8]}")
             if "pytest" in ci:
                 commands.setdefault("test_fast", ["pytest", "-x", "-q", "tests/unit"])
                 commands.setdefault("test_full", ["pytest", "-q"])
                 commands.setdefault("test_acceptance", ["pytest", "tests/acceptance", "-q"])
+                custom = _ci_pytest_command(ci)
+                if custom:
+                    commands["test_fast"] = custom  # the repo's confirmed test invocation
             if "ruff" in ci or "flake8" in ci:
                 commands.setdefault("lint", ["ruff", "check", "."])
             if "pnpm" in ci or "npm" in ci:
                 commands.setdefault("build", ["npm", "run", "build"])
+            if "setup" not in commands:
+                commands.setdefault("setup", ["pip", "install", "-e", ".[dev]"])
             break
-    return commands, surface, framework
+    return commands, surface, framework, evidence
+
+
+def _ci_pytest_command(ci: str) -> list[str] | None:
+    """Extract the repo's actual pytest invocation (e.g. `pytest tests/custom`) from CI."""
+    import re
+
+    m = re.search(r"(?m)\b(pytest)\s+([^\n|&%]{1,200})", ci)
+    if not m:
+        return None
+    args = [a for a in m.group(2).split() if a and a != "&&"]
+    return ["pytest", *args] if args else None

@@ -39,6 +39,14 @@ def fetch_snapshot(
             pr_by_number[number] = fresh_pr
     prs = sorted(pr_by_number.values(), key=lambda p: p.number)
 
+    # CI semantics (M19/N6): green is defined over the *required* check list.
+    # For each open PR populate `checks` from list_required_checks(head) so a
+    # non-required failing check never blocks merge.
+    for pr in prs:
+        checks = _resolve_required_checks(client, pr)
+        if checks is not None:
+            pr.checks = checks
+
     branches = BranchHeads(main=client.get_ref(settings.branches.main), dev=client.get_ref(settings.branches.dev))
 
     codie_yaml = None
@@ -105,3 +113,14 @@ def _spec_feature_from_paths(paths: list[str]) -> int | None:
         if m:
             return int(m.group(1))
     return None
+
+
+def _resolve_required_checks(client, pr: GitHubPR) -> list[dict] | None:
+    """Required-check status for an open PR head; None when unavailable."""
+    if pr.state != "open":
+        return None
+    try:
+        required = client.list_required_checks(pr.head)
+    except Exception:
+        return None
+    return [{"name": r.name, "state": r.state} for r in required]

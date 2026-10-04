@@ -76,12 +76,18 @@ class Workspace:
     def ensure(self) -> None:
         if not (self.path / ".git").exists():
             self.path.mkdir(parents=True, exist_ok=True)
-            self._ok(
-                self.git("clone", self.remote_url, str(self.path)),
-                "clone",
-            )
+            self._ok(self.git("clone", self.remote_url, str(self.path)), "clone")
         else:
             self.git("fetch", "--all", "--prune")
+        self._wire_credential_helper()
+
+    def _wire_credential_helper(self) -> None:
+        """§8.1: every fetch is authenticated as the kernel identity (tokenless remote)."""
+        try:
+            helper = _credential_helper(self.path, self.settings, "kernel")
+            self.git("config", "credential.helper", f"f!/bin/sh -c 'cat {helper}'")
+        except ConfigError:
+            pass  # kernel token not resolvable (tests); leave tokenless fetch
 
     def require_repo(self) -> None:
         if not (self.path / ".git").exists():
@@ -151,8 +157,11 @@ class Workspace:
         }
         r = self.git("push", "origin", f"HEAD:{branch}", env=env)
         if r.returncode != 0:
-            self.git("pull", "--rebase", f"origin/{self.integration_branch()}")
-            r = self.git("push", "origin", f"HEAD:{branch}", env=env)
+            # §7.3: the Coder contract forbids history rewriting — fail-and-requeue.
+            raise ConfigError(
+                f"push failed for {branch}: {r.stderr.strip() or r.stdout.strip()} — "
+                "merge integration first and retry; history rewriting is forbidden (denylist)"
+            )
         self._ok(r, "push")
 
     def merge_integration(self) -> None:
@@ -167,6 +176,14 @@ class Workspace:
 
     def worktree_dir(self, role: str, run_id: str) -> Path:
         return self.path / "wt" / f"{role}-{run_id}"
+
+    def worktree_lock(self, role: str, run_id: str) -> WorkspaceLock:
+        """Acquire the per-worktree lock (blocking) for the duration of a run (§8.1)."""
+        lock = WorkspaceLock(self.path / "wt" / f"{role}-{run_id}.lock")
+        if not lock.acquire(blocking=True):
+            raise ConfigError(f"could not lock worktree for {role}/{run_id}")
+        self._worktree_lock_held = lock
+        return lock
 
     def worktree_add(self, role: str, run_id: str, branch: str | None = None) -> Path:
         target = self.worktree_dir(role, run_id)
@@ -183,6 +200,9 @@ class Workspace:
         if not target.exists():
             return
         self.git("worktree", "remove", str(target), "--force")
+        if hasattr(self, "_worktree_lock_held"):
+            self._worktree_lock_held.release()
+            del self._worktree_lock_held
 
     # -- files ----------------------------------------------------------------------
 
@@ -211,5 +231,19 @@ def _write_askpass(workspace: Path, role: str, login: str, token: str) -> Path:
     script.write_text(
         '#!/bin/sh\ncase "$1" in\n  Username*) echo "$CODIE_GH_LOGIN" ;;\n  Password*) echo "$CODIE_GH_TOKEN" ;;\nesac\n'  # noqa: E501
     )
+    script.chmod(0o700)
+    return script
+
+
+def _credential_helper(workspace: Path, settings: Settings, role: str) -> Path:
+    """A credential-helper script that emits the acting role's login/token (§8.1)."""
+    from codie.config import resolve_role_token
+
+    token = resolve_role_token(settings, role)
+    login = settings.github.login(role)
+    helper_dir = workspace / ".codie"
+    helper_dir.mkdir(parents=True, exist_ok=True)
+    script = helper_dir / f"credential-helper-{role}.sh"
+    script.write_text(f'#!/bin/sh\necho "username={login}"\necho "password={token}"\n')
     script.chmod(0o700)
     return script

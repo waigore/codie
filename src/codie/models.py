@@ -276,6 +276,7 @@ class PRInfo(BaseModel):
     reviewer_approved: bool = False  # latest review on head is APPROVED by reviewer bot
     changes_requested: bool = False
     approved_non_bot: bool = False  # a non-bot APPROVED exists on the current head (§7.4 step 6)
+    files: list[str] = Field(default_factory=list)  # changed files (reviewer context, §7.1)
     created_at: datetime
     updated_at: datetime
     merged_at: datetime | None = None
@@ -323,6 +324,7 @@ class ProjectState(BaseModel):
     idle_dispatch_counts: dict[int, int] = Field(default_factory=dict)
     cycle_counts: dict[int, int] = Field(default_factory=dict)
     acceptance_failed_cycles: dict[int, int] = Field(default_factory=dict)
+    spec_attempts: dict[int, int] = Field(default_factory=dict)  # issue -> failed spec-validation attempts (C15)
     latest_heartbeats: dict[int, str] = Field(default_factory=dict)  # issue → "<run_id> <iso>"
     suite_markers: list[SuiteMarker] = Field(default_factory=list)
     eval_uncertain: set[str] = Field(default_factory=set)
@@ -471,6 +473,40 @@ class SpecDraftResult(BaseModel):
     open_questions: list[str] = Field(default_factory=list)
 
 
+class TestRunResult(BaseModel):
+    """Outcome of a tester run (AcceptanceRun / RegressionRun / VerifyTask; §7.5)."""
+
+    passed: bool
+    sha: str = ""
+    scope: Literal["fast", "full"] | None = None
+    summary: str = ""
+    evidence: str = ""
+
+
+class ReverifyResult(BaseModel):
+    """Tester bug re-verification outcome (§7.5 ReverifyBug)."""
+
+    passed: bool
+    rationale: str = ""
+    evidence: str = ""
+
+
+class EvalSuiteResult(BaseModel):
+    """Tester eval-suite outcome (§7.5 EvalSuite)."""
+
+    checked: list[str] = Field(default_factory=list)
+    uncertain: list[str] = Field(default_factory=list)
+    failed: list[str] = Field(default_factory=list)  # eval ids that failed → file bugs
+
+
+class ImplementResult(BaseModel):
+    """Coder confirmation after tool-acting implementation (§7.3)."""
+
+    branch: str = ""
+    pr_number: int | None = None
+    summary: str = ""
+
+
 class Finding(BaseModel):
     value: str
     evidence: list[str] = Field(default_factory=list)
@@ -577,6 +613,10 @@ Payload = (
     | ReleasePlan
     | BugDraft
     | ReviewDecision
+    | TestRunResult
+    | ReverifyResult
+    | EvalSuiteResult
+    | ImplementResult
 )
 
 PAYLOAD_KINDS: dict[str, type[BaseModel] | None] = {
@@ -591,16 +631,17 @@ PAYLOAD_KINDS: dict[str, type[BaseModel] | None] = {
     "BugDraft": BugDraft,
     "ReviewPR": ReviewDecision,
     "ReviewSpecPR": ReviewDecision,
-    # Tool-acting kinds: the crew applies writes directly; payload is raw.
-    "Implement": None,
-    "AddressReview": None,
-    "MergePR": None,
-    "MergeSpecPR": None,
-    "VerifyTask": None,
-    "RegressionRun": None,
-    "AcceptanceRun": None,
-    "ReverifyBug": None,
-    "EvalSuite": None,
+    # Tool-acting kinds: the crew applies writes via its tools and returns a
+    # structured result the kernel verifies and applies (§5.7).
+    "Implement": ImplementResult,
+    "AddressReview": ImplementResult,
+    "MergePR": ReviewDecision,
+    "MergeSpecPR": ReviewDecision,
+    "VerifyTask": TestRunResult,
+    "RegressionRun": TestRunResult,
+    "AcceptanceRun": TestRunResult,
+    "ReverifyBug": ReverifyResult,
+    "EvalSuite": EvalSuiteResult,
     "NeedsHuman": None,
 }
 

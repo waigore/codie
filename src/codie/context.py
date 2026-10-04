@@ -24,13 +24,22 @@ class ContextPack:
     sections: list[tuple[str, str]] = field(default_factory=list)
     omissions: list[dict] = field(default_factory=list)
     token_budget: int = 24_000
+    _estimate: int = 0
 
     @property
     def token_estimate(self) -> int:
-        return sum(estimate_tokens(body) for _, body in self.sections)
+        return self._estimate
 
     def add(self, title: str, body: str) -> None:
+        """§7.1: never silently truncate — over-budget sections go to `omissions`."""
+        if not body:
+            return
+        added = estimate_tokens(body)
+        if self._estimate + added > self.token_budget:
+            self.omissions.append({"section": title, "tokens_omitted": added})
+            return
         self.sections.append((title, body))
+        self._estimate += added
 
     def render(self) -> str:
         parts = []
@@ -68,6 +77,7 @@ def build_context(
     item: WorkItem | None = None,
     workspace=None,
     prd_extra: dict | None = None,
+    read_file_at=None,
 ) -> ContextPack:
     """Assemble the pack for one dispatch. `role` ∈ orchestrator/planner/coder/..."""
     pack = ContextPack(role=role, work_item=item, token_budget=settings.pack_budget(role))
@@ -113,6 +123,15 @@ def build_context(
     if role == "reviewer":
         if item and item.pr_number and (pr := state.find_pr(item.pr_number)):
             pack.add("PR", f"#{pr.number} {pr.title}\n\nbase: {pr.base} ← head: {pr.head}\n\n{pr.body}")
+            # §7.1 Reviewer pack: the diff + changed-file contents (§8.3).
+            changed = "\n".join(f"- {f}" for f in (pr.files or [])) or "(no file data available)"
+            pack.add("Changed files", changed)
+            if read_file_at is not None and pr.head:
+                parts: list[str] = []
+                for path in (pr.files or [])[:25]:
+                    content = read_file_at(path, pr.head)
+                    parts.append(f"## {path}\n{(content or '(unavailable at head)')[:4000]}")
+                pack.add("Diff content", "\n".join(parts) if parts else "(none)")
         if item and item.issue_number and (task := state.find_work_item(item.issue_number)):
             if task.parent and (feature := state.find_feature(task.parent)):
                 pack.add(
@@ -218,24 +237,49 @@ def _graph_text(state: ProjectState) -> str:
 
 
 def _spec_text(state: ProjectState, feature: Feature, workspace, only: str | None = None) -> str:
-    """Read the approved spec files from the integration-branch checkout."""
+    """Read the approved spec files at the integration-branch SHA (§7.1/§9.4)."""
     if workspace is None:
         return "(workspace unavailable)"
+    spec_paths = _resolve_spec_paths(state, feature)
     parts: list[str] = []
     for filename in ("feature-spec.md", "technical-spec.md"):
         if only and filename != only:
             continue
-        path = None
-        for p in feature.spec_paths:
-            if p.endswith(filename):
-                path = p
-                break
-        if path is None and feature.number:
-            # spec paths may be absent from the issue body; derive from merged PRs is done upstream.
-            path = f"specs/{feature.number}-*/{filename}"
-        content = workspace.read_file(path)
-        parts.append(f"## {filename}\n{content or '(missing at workspace — see merged spec PR)'}")
+        path = next((p for p in spec_paths if p.endswith(filename)), None)
+        content = workspace.read_file(path) if path else None
+        if content is None and path is None:
+            content = _fallback_spec_find(workspace, feature.number, filename)
+        parts.append(f"## {filename}\n{content or '(missing at integration head — see merged spec PR)'}")
     return "\n\n".join(parts)
+
+
+def _resolve_spec_paths(state: ProjectState, feature: Feature) -> list[str]:
+    """Real spec paths from the feature's `## Specs` section or merged spec PRs."""
+    paths: list[str] = list(feature.spec_paths)
+    if not paths:
+        for pr in state.prs:
+            if (
+                pr.spec_marker
+                and pr.state == "merged"
+                and (pr.linked_issue == feature.number or pr.number == feature.spec_pr_number)
+            ):
+                paths = sorted(set(paths) | set(pr.files))
+                break
+    return [p for p in paths if p.startswith("specs/")]
+
+
+def _fallback_spec_find(workspace, feature_number: int, filename: str) -> str | None:
+    """Last resort: scan the integration-branch checkout for the spec file."""
+    root = getattr(workspace, "path", None)
+    if root is None:
+        return None
+    matches = sorted(root.glob(f"specs/{feature_number}-*/{filename}"))
+    if not matches:
+        return None
+    try:
+        return matches[0].read_text()
+    except OSError:
+        return None
 
 
 def _human_feedback(state: ProjectState, issue_number: int | None) -> str:

@@ -75,12 +75,12 @@ class CrewAIKickoff(CrewRunner):
         self.prompt_dir = prompt_dir
 
     def _prompt(self, role: str) -> str:
-        from codie.roles.prompts import load_prompt
+        from codie.roles.prompts import load_prompt, shared_note
 
-        return load_prompt(role, dir_=self.prompt_dir)
+        return f"{shared_note()}\n\n{load_prompt(role, dir_=self.prompt_dir)}"
 
     def run_structured(self, role, item, pack, settings, output_model=None) -> CrewResult:
-        from codie.llm import build_llm
+        from codie.llm import build_llm, role_max_iter
 
         llm = build_llm(settings, role)
         prompt = self._prompt(role)
@@ -96,7 +96,7 @@ class CrewAIKickoff(CrewRunner):
             backstory=f"You are the {role} of the codie crew.",
             llm=llm,
             allow_code_execution=False,
-            max_iter=40,
+            max_iter=role_max_iter(role),
             verbose=False,
         )  # type: ignore[call-arg]
         task.agent = agent
@@ -113,7 +113,7 @@ class CrewAIKickoff(CrewRunner):
         return CrewResult(text=text, input_tokens=tokens[0], output_tokens=tokens[1], raw=result)
 
     def run_tool_agent(self, role, item, pack, settings, tools=None, tool_inputs=None) -> CrewResult:
-        from codie.llm import build_llm
+        from codie.llm import build_llm, role_max_iter
 
         llm = build_llm(settings, role)
         prompt = self._prompt(role)
@@ -125,7 +125,7 @@ class CrewAIKickoff(CrewRunner):
             llm=llm,
             tools=tools or [],
             allow_code_execution=False,
-            max_iter=40,
+            max_iter=role_max_iter(role),
             verbose=False,
         )  # type: ignore[call-arg]
         task = Task(

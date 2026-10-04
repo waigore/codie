@@ -169,6 +169,7 @@ def derive(snapshot: RepoSnapshot, settings: Settings | None = None) -> ProjectS
             updated_at=gpr.updated_at,
             merged_at=gpr.merged_at,
             approved_non_bot=approved_non_bot,
+            files=list(gpr.files),
         )
         pr_infos[gpr.number] = pr_info
         if release_marker and merged:
@@ -357,6 +358,9 @@ def _collect_markers(state: ProjectState, issue_number: int, body: str) -> None:
     hb = re.search(r"<!--\s*codie:heartbeat\s+(\S+)\s+([0-9TZ:.+-]+)\s*-->", body)
     if hb:
         state.latest_heartbeats[issue_number] = f"{hb.group(1)} {hb.group(2)}"
+    attempt = re.search(r"<!--\s*codie:attempt\s+\S+\s+(\d+)\s*-->", body)
+    if attempt:
+        state.spec_attempts[issue_number] = max(state.spec_attempts.get(issue_number, 0), int(attempt.group(1)))
 
 
 def _spec_branch_feature(branch: str) -> int | None:

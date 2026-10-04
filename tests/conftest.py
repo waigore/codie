@@ -45,6 +45,15 @@ def fresh_fake(repo: str = "acme/test"):
         "codie-tester-bot",
         "codie-kernel-bot",
     }
+    gh.map_roles(
+        {
+            "planner": "codie-planner-bot",
+            "coder": "codie-coder-bot",
+            "reviewer": "codie-reviewer-bot",
+            "tester": "codie-tester-bot",
+            "kernel": "codie-kernel-bot",
+        }
+    )
     gh.bootstrap_branches("main", "dev")
     return gh
 

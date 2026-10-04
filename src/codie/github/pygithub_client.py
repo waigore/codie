@@ -35,6 +35,7 @@ class PyGithubClient:
         tokens: dict[str, str],
         base_url: str = "https://api.github.com",
         default_actor: str = "kernel",
+        bot_logins: set[str] | None = None,
     ):
         self.owner, self.name = repo.split("/")
         self.repo_name = repo
@@ -42,6 +43,7 @@ class PyGithubClient:
         self.base_url = base_url
         self.actor: str = default_actor
         self._clients: dict[str, Github] = {}
+        self.bot_logins: set[str] = bot_logins or set()
 
     # -- wiring -----------------------------------------------------------------
 
@@ -178,7 +180,7 @@ class PyGithubClient:
                 )
         except Exception:
             # timeline API may be unavailable on some tokens; degrade gracefully.
-            pass
+            ...
         return events
 
     def list_prs(self) -> list[GitHubPR]:
@@ -225,7 +227,7 @@ class PyGithubClient:
             for s in combined.statuses:
                 out.append({"name": f"ci:{s.context}", "state": _map_check_state(s.state)})
         except Exception:
-            pass
+            ...
         return out
 
     def get_pr(self, number: int) -> GitHubPR | None:
@@ -255,7 +257,7 @@ class PyGithubClient:
                     )
                 )
         except Exception:
-            pass
+            ...
         return out
 
     def list_pr_files(self, number: int) -> list[str]:
@@ -320,12 +322,48 @@ class PyGithubClient:
         )
 
     def merge_pr(self, number: int, merge_method: str = "squash") -> bool:
+        """§7.4 step 6 + C20: draft/release/policy/unapproved merges refuse loudly."""
         try:
             pr_obj = self._repo().get_pull(number)
-            pr_obj.merge(merge_method=merge_method)
+        except Exception:
+            return False
+        if pr_obj.state != "open":
+            return False
+        if getattr(pr_obj, "draft", False):
+            return False
+        if "codie:release" in (pr_obj.body or ""):
+            return False
+        files = [f.filename for f in pr_obj.get_files()]
+        spec_pr = any(f.startswith("specs/") for f in files)
+        reviews = list(pr_obj.get_reviews())
+        approved = any(r.state == "APPROVED" for r in reviews)
+        non_bot_approved = any(r.state == "APPROVED" and r.user.login not in self.bot_logins for r in reviews)
+        # a spec PR merges on the Reviewer's own VERIFIED approval; treat any
+        # APPROVED as satisfying the downstream gate (the queue already gated
+        # on the reviewer bot's approval on head).
+        if spec_pr and not approved:
+            return False
+        policy_files = [f for f in files if f.split("/")[-1] in {".codie.yaml", "AGENTS.md", "CODEOWNERS"}]
+        if policy_files and not non_bot_approved:
+            return False
+        if not spec_pr and not policy_files and not approved:
+            return False
+        pr_obj.merge(merge_method=merge_method)
+        return True
+
+    def has_label(self, name: str) -> bool:
+        try:
+            self._repo().get_label(name)
             return True
         except Exception:
             return False
+
+    def rate_limit(self) -> dict:
+        rate = self._gh().get_rate_limit()
+        core = getattr(rate, "core", None)
+        remaining = int(getattr(core, "remaining", 0) or 0)
+        reset = getattr(core, "reset", None)
+        return {"remaining": remaining, "reset": reset}
 
     def reopen_issue(self, number: int) -> None:
         gi = self._repo().get_issue(number)
@@ -343,6 +381,28 @@ class PyGithubClient:
             return content.decoded_content.decode("utf-8") if content is not None else None
         except Exception:
             return None
+
+    def list_files(self, branch: str) -> list[str]:
+        """I-07: list top-level paths (recursively) on a branch for content detection."""
+        try:
+            contents = self._repo().get_contents("", ref=branch)
+        except Exception:
+            return []
+        out: list[str] = []
+        stack = list(contents)
+        while stack:
+            item = stack.pop()
+            if item.type == "dir":
+                try:
+                    stack.extend(self._repo().get_contents(item.path, ref=branch))
+                except Exception:
+                    continue
+            else:
+                out.append(item.path)
+        return out
+
+    def get_default_branch(self) -> str:
+        return self._repo().default_branch
 
     def get_ref(self, branch: str) -> str | None:
         try:
@@ -388,9 +448,9 @@ class PyGithubClient:
                 for s in statuses:
                     out[s.context] = _map_check_state(s.state)
             except GithubException:
-                pass
+                ...
         except Exception:
-            pass
+            ...
         return out
 
     def set_commit_status(self, ref: str, state: str, description: str = "") -> None:
@@ -402,7 +462,7 @@ class PyGithubClient:
             commit = self._repo().get_commit(ref)
             commit.create_status(state=state, description=description, context="codie/ci")
         except Exception:
-            pass
+            ...
 
     def upsert_label(self, name: str, color: str, description: str = "") -> None:
         label = self._repo().get_label(name)
@@ -414,16 +474,23 @@ class PyGithubClient:
     # -- admin protocol -------------------------------------------------------------
 
     def pin_issue(self, number: int, pinned: bool) -> None:
+        """Pin/unpin via the real issues-pin API (GitHub public beta endpoint)."""
         gi = self._repo().get_issue(number)
         gi.edit(state="open")
-        if not pinned:
-            return
-        # PyGithub has no direct pin binding; Apps use a repo-level API.
+        from github import GithubException
+
+        data = {"state": "open"}
         try:
             requester: Requester = self._repo()._requester  # type: ignore[attr-defined]
-            requester.requestJsonAndCheck("PATCH", f"/repos/{self.repo_name}/issues/{number}/pinned")
-        except Exception:
-            pass
+            path = f"/repos/{self.owner}/{self.name}/issues/{number}/pin"
+            method = "POST" if pinned else "DELETE"
+            headers, _body = requester.requestJsonAndCheck(method, path, input=data)
+            if headers.get("status", 200) >= 300:
+                raise GithubException(
+                    int(headers.get("status", 500)), {"message": f"pin endpoint returned {headers.get('status')}"}
+                )  # noqa: E501
+        except GithubException as exc:
+            raise ConfigError(f"failed to {'pin' if pinned else 'unpin'} issue #{number}: {exc.data}") from exc
 
     def create_ref(self, branch: str, sha: str) -> None:
         self._repo().create_git_ref(f"refs/heads/{branch}", sha)
@@ -463,20 +530,48 @@ class PyGithubClient:
         require_approvals: int,
         checks: list[str] | None = None,
     ) -> None:
+        """§9.3: require PRs, approval count, and status checks — raise on partial failure."""
+        from github import GithubException
+
+        branch_obj: Branch = self._repo().get_branch(branch)
+        kwargs: dict[str, Any] = {
+            "user_required_approving_review_count": require_approvals if require_prs else 0,
+            "enforce_admins": True,
+        }
+        if require_prs:
+            kwargs["required_status_checks"] = checks or None
+            kwargs["strict"] = True
+            kwargs["required_pull_request_reviews"] = None
         try:
-            branch_obj: Branch = self._repo().get_branch(branch)
-            branch_obj.edit_protection(
-                required_approving_review_count=require_approvals if require_prs else 0,
-                enforce_admins=True,
-            )
-        except Exception:
-            pass
+            branch_obj.edit_protection(**kwargs)
+        except GithubException as exc:
+            raise ConfigError(f"failed to protect {branch}: {exc.data}") from exc
 
     def update_repo(self, merge_method: str, delete_branch_on_merge: bool = True) -> None:
-        self._repo().edit(delete_branch_on_merge=delete_branch_on_merge)
+        """Align repo merge options to the confirmed merge method (I-05)."""
+        from github import GithubException
+
+        allow_merge = merge_method == "merge"
+        allow_squash = merge_method == "squash"
+        allow_rebase = merge_method == "rebase"
+        try:
+            self._repo().edit(
+                merge_commit_allowed=allow_merge,
+                squash_merge_allowed=allow_squash,
+                rebase_merge_allowed=allow_rebase,
+                delete_branch_on_merge=delete_branch_on_merge,
+            )
+        except GithubException as exc:
+            raise ConfigError(f"failed to update repo options: {exc.data}") from exc
 
     def invite_collaborator(self, login: str, permission: str = "push") -> None:
         self._repo().add_to_collaborators(login, permission=permission)
+
+    def list_collaborators(self) -> list[str]:
+        try:
+            return [c.login for c in self._repo().get_collaborators()]
+        except Exception:
+            return []
 
     def get_authenticated_user(self) -> str:
         return self._gh().get_user().login

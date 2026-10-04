@@ -193,6 +193,45 @@ def test_flag_filter_drops_blocked_stream_keeps_siblings(world, settings):
     assert 4 in issues
 
 
+def test_orchestrator_pick_honors_strategy_order(world, tmp_path, settings):
+    """I-08: with a stub LLM the dispatcher follows the strategy's pick, which
+    differs from the raw queue head — proof the pick is agent-mediated, not a
+    fixed head rule."""
+
+    from codie.state import parse as _parse
+
+    gh = world
+    gh.add_comment_to_issue(1, f"<!-- codie:prd {_parse.prd_fingerprint(gh.get_issue(1).body)} -->")
+    gh.add_issue(2, "Feature", "**Evals:** E1", labels=["type:feature", "status:in-progress"])
+    spec = gh.add_pr(6, "Specs", "Refs #2", "spec/2-x", "dev", files=["specs/2-x/feature-spec.md"])
+    spec.state = "merged"
+    spec.merged_at = dt()
+    gh.add_issue(4, "dev task", "**Parent:** #2", labels=["type:task", "status:ready", "kind:dev"])
+    gh.add_issue(5, "test task", "**Parent:** #2", labels=["type:task", "status:ready", "kind:test"])
+    gh.add_issue(9, "a bug", "## Reproduction\nx", labels=["type:bug", "status:ready"])
+    sand_cache = Cache().open_or_rebuild(tmp_path / "s.db")
+
+    def strategy(queue, projected, settings):
+        return f"kind:{queue[-1].kind}"  # the LAST lawful item (VerifyTask)
+
+    kernel = Kernel(
+        settings=settings, client=gh, cache=sand_cache, crew_runner=make_stub(gh, settings), strategy=strategy
+    )
+    outcome = kernel.cycle(now=dt())
+    assert outcome.queue, "a nonempty lawful queue is expected"
+    picked = outcome.dispatched[0].item if outcome.dispatched else None
+    assert picked is not None, "the strategy's pick should be dispatched"
+    assert picked.kind == "VerifyTask"  # not the head (a rule-8 Implement)
+    assert outcome.queue[0].kind != picked.kind
+
+    # an adversarial pick that is NOT in the lawful queue is refused by the kernel
+    refused = kernel.dispatch_work_item(
+        WorkItem(kind="VerifyTask", role="tester", entity="invented", issue_number=999, rule=9),
+        derive_state(gh, settings),
+    )
+    assert refused.status == "refused"
+
+
 def test_dispatch_refuses_non_queue_item(world, tmp_path, settings):
     gh = world
     cache = Cache().open_or_rebuild(tmp_path / "c.db")
@@ -201,6 +240,37 @@ def test_dispatch_refuses_non_queue_item(world, tmp_path, settings):
     bogus = WorkItem(kind="Implement", role="coder", entity="invented work", issue_number=999, rule=0)
     state = derive_state(gh, settings)
     before = len(kernel.active_runs)
-    outcome = kernel.dispatch_work_item(bogus, state, force=False)
+    outcome = kernel.dispatch_work_item(bogus, state)
     assert outcome.status == "refused"  # kernel refuses invented work (§6.1 invariant 1)
     assert len(kernel.active_runs) == before
+
+
+def test_dispatch_refuses_policy_and_draft_merges(world, tmp_path, settings):
+    """I-11: the merge gate refuses a draft PR and a policy-only PR on the fake."""
+    gh = world
+    gh.add_issue(2, "Feature", "x", labels=["type:feature", "status:specified"])
+    draft = gh.add_pr(21, "Draft", "Refs #2", "feature/2-x", "dev", draft=True)
+    draft.files = ["src/x.py"]
+    policy = gh.add_pr(22, "Policy", "Refs #2", "feature/2-y", "dev")
+    policy.files = [".codie.yaml"]
+    gh.set_actor("reviewer")
+    assert gh.merge_pr(21) is False  # draft refused
+    assert gh.merge_pr(22) is False  # policy PR without a non-bot APPROVED refused
+    # a non-bot APPROVED unlocks the policy PR
+    gh.add_review(22, "APPROVED", "human")
+    assert gh.merge_pr(22) is True
+
+
+def test_dispatch_accepts_approved_task_pr(world, settings):
+    """I-11: an approved task PR merges on the fake."""
+    gh = world
+    gh.add_issue(2, "Feature", "x", labels=["type:feature", "status:planned"])
+    gh.add_issue(5, "Task", "**Parent:** #2", labels=["type:task", "status:in-review", "kind:dev"])
+    pr = gh.add_pr(23, "Task PR", "Refs #5", "feature/5-x", "dev")
+    pr.files = ["src/x.py"]
+    gh.set_actor("developer-user")
+    assert gh.merge_pr(23) is False  # no approval yet
+    gh.add_review(23, "CHANGES_REQUESTED", "codie-reviewer-bot")
+    assert gh.merge_pr(23) is False  # changes requested
+    gh.add_review(23, "APPROVED", "codie-reviewer-bot")
+    assert gh.merge_pr(23) is True

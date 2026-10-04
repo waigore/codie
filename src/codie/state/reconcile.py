@@ -21,6 +21,7 @@ class ReconcileMutations(BaseModel):
     comments: dict[int, str] = Field(default_factory=dict)
     close: list[int] = Field(default_factory=list)
     reopen: list[int] = Field(default_factory=list)
+    close_prs: list[int] = Field(default_factory=list)
 
 
 TERMINAL_TASK = {"done", "cancelled"}
@@ -298,7 +299,27 @@ def plan_reconcile(
             comment += "\n\nCleared `flag:blocked` (set by the orphaned run)."
         mutations.comments[number] = comment
 
-    # ---- 6. issue open/close lifecycle (§5.5) ----
+    # ---- 6. revised re-plan routing (§5.5, §5.6 rule 3) ----
+    for feature in [f for f in projected.features if f.status == "revised"]:
+        marker = projected.revision_marker.get(feature.number)
+        if marker != "requirements":
+            continue
+        # requirements revision: cancel every non-terminal child, close its open
+        # linked PR, and return to speccing so rule 4 re-specs (§7.6).
+        feature.status = "speccing"  # type: ignore[assignment]
+        for child in projected.tasks + projected.bugs:
+            if child.parent != feature.number or child.status in TERMINAL_TASK:
+                continue
+            child.status = "cancelled"  # type: ignore[assignment]
+            if (
+                child.linked_pr
+                and (cpr := projected.find_pr(child.linked_pr))
+                and cpr.state == "open"
+                and cpr.number not in mutations.close_prs
+            ):
+                mutations.close_prs.append(cpr.number)
+
+    # ---- 7. issue open/close lifecycle (§5.5) ----
     for number, entity in _all_items(projected).items():
         terminal = entity.status in TERMINAL_TASK or (
             isinstance(entity, Feature) and entity.status in TERMINAL_FEATURE
@@ -309,7 +330,7 @@ def plan_reconcile(
         if not terminal and not opening:
             mutations.reopen.append(number)
 
-    # ---- 7. label diff ----
+    # ---- 8. label diff ----
     for number in [
         *projected.raw_labels.keys(),
         *[i.number for i in _all_items(projected).values()],

@@ -58,14 +58,13 @@ def cmd_init(
         _doctor(repo, config_file)
         return
     from codie.provision import provision
-    from codie.survey import gather_survey
+    from codie.survey import gather_survey, survey_commands, survey_surface
 
     settings = _load_settings(repo, config_file)
     admin_token = config.resolve_admin_token(settings)
     from codie.github.pygithub_client import PyGithubClient
 
     client: object = PyGithubClient(repo, {"kernel": admin_token}, base_url=settings.github.api_base_url)
-    # read-only survey via admin token; provision uses the same channel in --dry-run style tests.
     try:
         survey = gather_survey(client, settings, repo)  # type: ignore[arg-type]
     except Exception as exc:
@@ -76,18 +75,39 @@ def cmd_init(
         content = Path(prd).read_text()
         survey.prd = survey.prd.model_copy(update={"source": "supplied", "content": content})
     elif not yes and not pr:
-        _confirm(survey)
+        _confirm_per_dimension(survey, settings)
 
-    report = provision(settings, client, survey, repo)  # type: ignore[arg-type]
+    # Apply the confirmed conventions into the settings the provisioning renders
+    # (.codie.yaml gets the surveyed commands/surface — I-02).
+    commands = survey_commands(survey)
+    for name, argv in commands.items():
+        settings.overrides.commands[name] = argv
+    surface, framework = survey_surface(survey)
+    settings.overrides.surface = surface  # type: ignore[assignment]
+    settings.overrides.acceptance.framework = framework
+
+    report = provision(
+        settings,
+        client,  # type: ignore[arg-type]
+        survey,
+        repo,
+        prd_content=survey.prd.content or None,
+        defer_settings=bool(pr),
+    )
     typer.secho("\n".join(report.lines()), fg=typer.colors.GREEN)
     if report.prd_issue_number is None and not prd:
         typer.secho("\nNo PRD yet; `codie start` will refuse until one exists.", fg=typer.colors.YELLOW)
 
 
-def _confirm(survey) -> None:
-    typer.echo("codie survey — proposed conventions to confirm:")
+def _confirm_per_dimension(survey, settings) -> None:
+    """Phase 2 — per-dimension confirm-or-edit + command authorization (I-03)."""
+    typer.secho("codie survey — proposed conventions to confirm:")
     for dim, finding in survey.dimensions.items():
-        typer.echo(f"  - {dim}: {finding.value} [{finding.source}]")
+        tag = finding.source
+        typer.echo(f"  - {dim}: {finding.value} [{tag}]")
+        for ev in finding.evidence[:4]:
+            typer.echo(f"      evidence: {ev}")
+    typer.echo("\nIssue triage (bulk-accept, per-issue overrides):")
     for t in survey.issue_triage:
         typer.echo(f"  - adopt #{t.number} as {t.proposed_type} ({t.proposed_status or ''}): {t.rationale}")
     typer.echo(f"  - PRD source: {survey.prd.source}")
@@ -95,8 +115,34 @@ def _confirm(survey) -> None:
         typer.echo("--- PRD preview ---")
         typer.echo(survey.prd.content[:1200])
         typer.echo("--- end preview ---")
-    answer = input("Accept these proposals? [Y/n] ").strip().lower()
-    if answer not in {"", "y", "yes"}:
+
+    # Command authorization boundary (Product §4.2 phase 2): the confirm UI must
+    # show the exact command set that will be written to .codie.yaml and later run.
+    commands_src = survey.dimensions.get("commands")
+    typer.secho("\nThe following commands are authorized for execution on this machine:", fg=typer.colors.YELLOW)
+    if commands_src:
+        import json as _json
+
+        try:
+            for name, argv in _json.loads(commands_src.value).items():
+                typer.echo(f"  - {name}: {' '.join(argv)}")
+        except _json.JSONDecodeError:
+            typer.echo("  (none detected)")
+    else:
+        typer.echo("  (none detected)", err=True)
+
+    answer = input("Accept these proposals? [Y/n/e] (e = edit) ").strip().lower()
+    if answer in {"e", "edit"}:
+        from codie.survey import apply_dimension_edits
+
+        edits: dict[str, str] = {}
+        for dim, finding in survey.dimensions.items():
+            current = input(f"  {dim} [{finding.value}]: ").strip()
+            if current:
+                edits[dim] = current
+        apply_dimension_edits(survey, edits)
+        typer.secho("Edited proposals recorded.", fg=typer.colors.GREEN)
+    elif answer not in {"", "y", "yes"}:
         typer.echo("Aborting; nothing was provisioned.")
         raise typer.Exit(1)
 
@@ -111,29 +157,106 @@ def cmd_start(
     """Start or resume the crew on a repo (Technical Spec §6.1/§6.4)."""
     repo = _repo_from_url(url)
     settings = _load_settings(repo, config_file)
+
+    # §6.4: startup validation before anything else (M17/M26/M32).
+    config.validate_effective(settings)
     overrides, client = _project_overrides_from_head(repo, settings)
     settings = config.build_settings(settings, repo, overrides)
 
     from codie.github.pygithub_client import PyGithubClient
     from codie.orchestrator import Kernel
+    from codie.provision import require_provisioned
     from codie.workspace import Workspace
 
     role_tokens = {role: _env_or_exit(settings, role) for role in ("planner", "coder", "reviewer", "tester", "kernel")}
-    client = PyGithubClient(repo, role_tokens, base_url=settings.github.api_base_url)
+    client = PyGithubClient(
+        repo, role_tokens, base_url=settings.github.api_base_url, bot_logins=settings.github.bot_logins()
+    )
+
+    # §6.1 preflight chain (I-13): provisioning checklist, label sync, PRD check.
+    require_provisioned(settings, client, repo)
+
     owner, name = repo.split("/")
     cache = Cache().open_or_rebuild(cache_path(owner, name))
     workspace = Workspace(settings.project.workspace_path, settings)
     workspace.ensure()
     workspace.janitor(coder_active=False)
 
-    kernel = Kernel(settings=settings, client=client, workspace=workspace, cache=cache, dry_run=dry_run)
+    from codie.github.labels import ensure_label_set
+
+    ensure_label_set(client)
+
+    from codie.dashboard.roster import Roster
+
+    roster = Roster() if (settings.dashboard.enabled and not once) else None
+    kernel = Kernel(
+        settings=settings,
+        client=client,
+        workspace=workspace,
+        cache=cache,
+        dry_run=dry_run,
+        roster=roster,
+        async_runs=not once,
+    )
     _write_pid(owner, name)
+    dashboard = None
     try:
-        outcome = kernel.run(max_cycles=1 if once else None)
+        if roster is not None:
+            dashboard = _start_dashboard(settings, cache, roster, kernel)
+        outcome = kernel.run(max_cycles=1) if once else kernel.run()
     finally:
+        if dashboard is not None:
+            dashboard.stop()
         _remove_pid(owner, name)
     if outcome.halted:
         typer.secho("Release PR merged — codie halts (success).", fg=typer.colors.GREEN)
+
+
+def _start_dashboard(settings, cache, roster, kernel):
+    """(I-23) Boot the embedded dashboard; serve on the next free port, localhost-first."""
+    from codie.dashboard.server import create_app
+
+    token = None
+    host = settings.dashboard.host
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        key = settings.dashboard.token_env
+        import os
+
+        token = os.environ.get(key) if key else None
+        if not token:
+            typer.secho(f"dashboard.token_env {key!r} is unset; refusing non-loopback dashboard", fg=typer.colors.RED)
+            raise typer.Exit(1)
+
+    import threading
+
+    import uvicorn
+
+    app = create_app(cache, roster=roster, token=token, kernel=kernel)
+    port = settings.dashboard.port
+    resolved_port = _next_free_port(host, port, attempts=5)
+    if resolved_port is None:
+        typer.secho("no free dashboard port; dashboard disabled", fg=typer.colors.YELLOW)
+        return None
+    cfg = uvicorn.Config(app, host=host, port=resolved_port, log_level="warning", lifespan="on")
+    server = uvicorn.Server(cfg)
+
+    thread = threading.Thread(target=server.run, daemon=True, name="codie-dashboard")
+    thread.start()
+    typer.secho(f"dashboard on http://{host}:{resolved_port}", fg=typer.colors.GREEN)
+    return server
+
+
+def _next_free_port(host: str, port: int, attempts: int = 5) -> int | None:
+    import socket
+
+    for candidate in range(port, port + attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((host, candidate))
+                return candidate
+            except OSError:
+                continue
+    return None
 
 
 def _env_or_exit(settings: Settings, role: str) -> str:

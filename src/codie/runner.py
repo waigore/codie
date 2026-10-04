@@ -161,13 +161,20 @@ class Runner:
         env.update(self.settings.overrides.run_app_session.env)
         env["CODIE_DISPLAY"] = self.settings.overrides.run_app_session.display
         env.update(env_extra or {})
-        display_proc: bool = False
+        xvfb: subprocess.Popen | None = None
         if self.settings.overrides.run_app_session.display == "xvfb":
-            r = self.run(["Xvfb", ":99", "-screen", "0", "1024x768x24"], cwd=base, timeout=10)
-            if r.exit_code != 0:
-                raise ConfigError("Xvfb not found; install xvfb or set display: headless")
+            # launch Xvfb as a side-process Popen (never a blocking run), stopped
+            # at work-item end through the same kill path as the app (I-21).
+            try:
+                xvfb = subprocess.Popen(
+                    ["Xvfb", ":99", "-screen", "0", "1024x768x24"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as exc:
+                raise ConfigError("Xvfb not found; install xvfb or set display: headless") from exc
             env["DISPLAY"] = ":99"
-            display_proc = True
         elif self.settings.overrides.run_app_session.display == "native":
             if "DISPLAY" not in os.environ:
                 raise ConfigError("display: native requires DISPLAY to be set")
@@ -184,17 +191,39 @@ class Runner:
         started = _wait_for_ports(self.settings.overrides.run_app_session.ports, timeout)
         if not started:
             _kill(proc)
+            if xvfb is not None:
+                _kill(xvfb)
             raise ConfigError("run_app session did not accept its declared ports in time")
-        return _Session(proc, display_proc)
+        return _Session(proc, xvfb)
+
+
+def run_eval_commands(settings: Settings, workspace_root, evals, timeout: int | None = None) -> dict[str, bool]:
+    """Run every command eval via the jailed runner; returns {id: passed} (§7.5/§7.7).
+
+    `human` evals and evals without a `run` command are skipped (the crew flags
+    them uncertain). The denylist and cwd jail apply to every execution (I-18).
+    """
+    runner = Runner(settings, Path(workspace_root))
+    results: dict[str, bool] = {}
+    for entry in evals:
+        if not entry.command:
+            continue  # human eval — the checkbox waits on the human
+        command = list(entry.command)
+        runner.check_denylist(command)
+        result = runner.run(command, timeout=timeout)
+        results[entry.id] = result.ok
+    return results
 
 
 @dataclass
 class _Session:
     proc: subprocess.Popen
-    xvfb: bool
+    xvfb: subprocess.Popen | None = None
 
     def stop(self) -> None:
         _kill(self.proc)
+        if self.xvfb is not None:
+            _kill(self.xvfb)
 
 
 def _wait_for_ports(ports: list[int], timeout: int, interval: float = 0.5) -> bool:

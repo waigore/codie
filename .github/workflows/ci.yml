@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+  schedule:
+    - cron: "0 3 * * *"  # nightly e2e run against the designated sandbox repo (I-29)
 
 jobs:
   quality:

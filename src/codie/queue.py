@@ -21,6 +21,10 @@ def _feature_spec_pr(state: ProjectState, feature_number: int):
 
 
 def ci_green(pr) -> bool:
+    # §7.4 step 3: green means the required-check list is empty or every entry is
+    # `success`. `pr.checks` carries the *required* check states (populated at
+    # fetch time via list_required_checks, M19/N6) — a non-required failing check
+    # is never in this list and therefore never blocks merge.
     return all(check.state == "success" for check in pr.checks)
 
 
@@ -75,12 +79,27 @@ def compute_queue(state: ProjectState, settings: Settings, now: datetime | None 
             continue
         spec_pr = _feature_spec_pr(state, feature.number)
 
-        # Rule 3: revised, no revision marker
+        # Rule 3: revised, no revision marker; if the marker routes, the queue
+        # emits Replan (marker == implementation) or leaves the routing to the
+        # reconciler (marker == requirements cancels children and re-specs).
         if feature.status == "revised" and feature.number not in state.revision_marker:
             matched_features.add(feature.number)
             items.append(
                 _item(
                     "AssessRevision",
+                    "planner",
+                    entity=_f(feature),
+                    issue_number=feature.number,
+                    priority=feature.priority,
+                    rule=3,
+                )
+            )
+            continue
+        if feature.status == "revised" and state.revision_marker.get(feature.number) == "implementation":
+            matched_features.add(feature.number)
+            items.append(
+                _item(
+                    "Replan",
                     "planner",
                     entity=_f(feature),
                     issue_number=feature.number,
@@ -357,10 +376,11 @@ def compute_queue(state: ProjectState, settings: Settings, now: datetime | None 
         return []
 
     # §5.6 total order: rule number, bugs-first, priority, issue number
+    bug_numbers = {b.number for b in state.bugs}
     items.sort(
         key=lambda w: (
             w.rule,
-            0 if (bugs_first and _is_bug_work(w)) else 1,
+            0 if (bugs_first and _is_bug_work(w, bug_numbers)) else 1,
             _PRIORITY_RANK[w.priority],
             w.issue_number or 0,
         )
@@ -388,8 +408,9 @@ def _i(item) -> str:
     return f"#{item.number} {item.title}"
 
 
-def _is_bug_work(w: WorkItem) -> bool:
-    return w.kind in {"Implement"} and w.issue_number is not None  # precise check below
+def _is_bug_work(w: WorkItem, bug_numbers: set[int]) -> bool:
+    """Bugs outrank features: only `Implement` items whose target issue is a bug."""
+    return w.kind == "Implement" and w.issue_number is not None and w.issue_number in bug_numbers
 
 
 def _has_ready_spec_pr(state: ProjectState, feature) -> bool:
@@ -410,6 +431,16 @@ def _is_task_pr(pr, settings: Settings) -> bool:
     return pr.linked_issue is not None
 
 
+def _acceptance_pending(state: ProjectState, feature) -> bool:
+    """Would this feature match rule 11 if the full-suite marker were current? (§7.5)"""
+    children = [t for t in state.tasks if t.parent == feature.number]
+    non_cancelled = [t for t in children if t.status != "cancelled"]
+    if not non_cancelled or any(t.status != "done" for t in non_cancelled):
+        return False
+    linked_bugs = [b for b in state.bugs if b.parent == feature.number]
+    return not any(b.status not in {"done", "cancelled"} for b in linked_bugs)
+
+
 def _acceptance_ready(state: ProjectState, feature) -> bool:
     children = [t for t in state.tasks if t.parent == feature.number]
     non_cancelled = [t for t in children if t.status != "cancelled"]
@@ -426,7 +457,12 @@ def _acceptance_ready(state: ProjectState, feature) -> bool:
 
 
 def _regression_due(state: ProjectState, settings: Settings, now: datetime) -> set[str]:
-    """Returns a set of scopes due: {'fast'}, {'full'}, both, or empty."""
+    """Returns a set of scopes due: {'fast'}, {'full'}, both, or empty.
+
+    I-19: the "unverified merge" condition (fast) is cleared by *any* passing
+    suite marker at the current integration head — a passing full run already
+    contains the fast subset, so it never starves rules 13–14.
+    """
     merged_task_prs = [
         pr for pr in state.prs if pr.state == "merged" and not pr.release_marker and pr.spec_marker is False
     ]
@@ -434,9 +470,12 @@ def _regression_due(state: ProjectState, settings: Settings, now: datetime) -> s
         return set()
     dev_head = state.branches.dev
     latest_fast = state.latest_suite_marker("fast")
-    fast_due = latest_fast is None or dev_head is None or latest_fast.sha != dev_head
-    # full run due when cadence elapsed or a feature awaits acceptance (rule 11)
     latest_full = state.latest_suite_marker("full")
+    head_verified = any(
+        m is not None and m.sha == dev_head and m.passed for m in (latest_fast, latest_full) if m is not None
+    )
+    fast_due = not head_verified
+    # full run due when cadence elapsed or a feature awaits acceptance (rule 11)
     cadence = settings.overrides.workflow.full_test_cadence_minutes
     full_due = False
     if dev_head is None or latest_full is None or latest_full.sha != dev_head or not latest_full.passed:
@@ -446,10 +485,12 @@ def _regression_due(state: ProjectState, settings: Settings, now: datetime) -> s
         if age >= cadence:
             full_due = True
     if not full_due:
-        for feature in state.features:
-            if _acceptance_ready(state, feature):
-                full_due = True
-                break
+        stale_full = latest_full is None or dev_head is None or latest_full.sha != dev_head or not latest_full.passed
+        if stale_full:
+            for feature in state.features:
+                if _acceptance_pending(state, feature):
+                    full_due = True
+                    break
     scopes: set[str] = set()
     if fast_due:
         scopes.add("fast")
@@ -464,6 +505,9 @@ def _eval_suite_ready(state: ProjectState) -> bool:
     accepted = [f for f in state.features if f.status == "accepted"]
     non_cancelled = [f for f in state.features if f.status != "cancelled"]
     if not accepted or len(non_cancelled) != len(accepted):
+        return False
+    # §5.4 rule 9 / §7.7: no ongoing eval suite while any bug is open.
+    if state.open_bugs:
         return False
     unchecked = state.unchecked_evals()
     if not unchecked:

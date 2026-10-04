@@ -56,6 +56,14 @@ class FakeGitHub:
         self.actor: str = "kernel"
         self.next_issue_number: int | None = None  # set by tests for determinism
         self.bot_logins: set[str] = set()
+        self.role_logins: dict[str, str] = {}  # role name → bot login (author attribution)
+
+    def map_roles(self, mapping: dict[str, str]) -> None:
+        """Map role names to their bot logins so authorship matches derive (§9.2)."""
+        self.role_logins.update(mapping)
+
+    def _login_for(self, actor: str) -> str:
+        return self.role_logins.get(actor, actor)
 
     # -- wiring helpers ---------------------------------------------------------
 
@@ -237,7 +245,7 @@ class FakeGitHub:
             labels=list(labels),
             created_at=self.clock(),
             updated_at=self.clock(),
-            user_login=self.actor,
+            user_login=self._login_for(self.actor),
         )
         self.issues[number] = issue
         for label in issue.labels:
@@ -278,7 +286,7 @@ class FakeGitHub:
         c = GitHubComment(
             id=self._new_comment_id(),
             issue_number=number,
-            user_login=self.actor,
+            user_login=self._login_for(self.actor),
             body=body,
             created_at=self.clock(),
             updated_at=self.clock(),
@@ -323,7 +331,7 @@ class FakeGitHub:
             draft=draft,
             head=head,
             base=base,
-            user_login=self.actor,
+            user_login=self._login_for(self.actor),
             created_at=self.clock(),
             updated_at=self.clock(),
         )
@@ -358,13 +366,15 @@ class FakeGitHub:
             pr.updated_at = self.clock()
 
     def create_review(self, pr_number: int, state: str, body: str, comments: list[dict] | None = None) -> GitHubReview:
+        pr = self.prs[pr_number]
         review = GitHubReview(
-            user_login=self.actor,
+            user_login=self._login_for(self.actor),
             state=state,
             body=body,
             submitted_at=self.clock(),
+            commit_id=self.branches.get(pr.head),
+            on_head=True,
         )
-        pr = self.prs[pr_number]
         pr.reviews.append(review)
         pr.updated_at = self.clock()
         if comments:
@@ -381,8 +391,21 @@ class FakeGitHub:
             self.commit_statuses.setdefault(self.branches.get(pr.head, ""), {})[c["name"]] = c["state"]
 
     def merge_pr(self, number: int, merge_method: str = "squash") -> bool:
+        """I-11 §7.4 merge gate: draft/release/policy/approval refused."""
         pr = self.prs.get(number)
-        if pr is None or pr.state == "merged" or pr.state == "closed":
+        if pr is None or pr.state != "open":
+            return False
+        if pr.draft:
+            return False
+        if "codie:release" in (pr.body or "") and self.actor in self.bot_logins:
+            return False
+        files = pr.files or []
+        policy = [f for f in files if f.split("/")[-1] in {".codie.yaml", "AGENTS.md", "CODEOWNERS"}]
+        if policy and not self._on_head_non_bot_approved(pr):
+            return False
+        if any(f.startswith("specs/") for f in files) and not self._on_head_reviewer_approved(pr):
+            return False
+        if not any(f.startswith("specs/") for f in files) and not self._on_head_any_approved(pr):
             return False
         base_tree = self.trees.setdefault(pr.base, {})
         head_tree = self.trees.setdefault(pr.head, {})
@@ -392,6 +415,19 @@ class FakeGitHub:
         pr.updated_at = self.clock()
         self._bump_commit(pr.base)
         return True
+
+    def _on_head_reviews(self, pr: GitHubPR) -> list[GitHubReview]:
+        head_sha = self.branches.get(pr.head)
+        return [r for r in pr.reviews if r.on_head or r.commit_id == head_sha]
+
+    def _on_head_reviewer_approved(self, pr: GitHubPR) -> bool:
+        return any(r.state == "APPROVED" and r.user_login in self.bot_logins for r in self._on_head_reviews(pr))
+
+    def _on_head_non_bot_approved(self, pr: GitHubPR) -> bool:
+        return any(r.state == "APPROVED" and r.user_login not in self.bot_logins for r in self._on_head_reviews(pr))
+
+    def _on_head_any_approved(self, pr: GitHubPR) -> bool:
+        return any(r.state == "APPROVED" for r in self._on_head_reviews(pr))
 
     def reopen_issue(self, number: int) -> None:
         issue = self.issues.get(number)
@@ -415,19 +451,35 @@ class FakeGitHub:
         return list(self.trees.get(branch, {}).keys())
 
     def _resolve_ref(self, ref: str) -> str:
-        """Refs are branch names; tolerate SHA values by resolving back to a branch."""
+        """Refs are branch names; tolerate SHA values by resolving back to a branch.
+
+        When several branches share one SHA (a seeded repo), prefer the
+        integration branch (dev/develop) over the stable one so `.codie.yaml`
+        reads come from where the daemon expects them (§5.1).
+        """
         if ref in self.branches:
             return ref
-        for branch, sha in self.branches.items():
-            if sha == ref:
-                return branch
-        return ref
+        matches = [branch for branch, sha in self.branches.items() if sha == ref]
+        if not matches:
+            return ref
+        for preferred in ("develop", "dev"):
+            if preferred in matches:
+                return preferred
+        return matches[0]
 
     def get_ref(self, branch: str) -> str | None:
         return self.branches.get(branch)
 
     def list_required_checks(self, ref: str) -> list[RequiredCheck]:
-        statuses = self.commit_statuses.get(ref, {})
+        targets = {ref}
+        if ref in self.branches:
+            targets.add(self.branches[ref])
+        for branch, sha in self.branches.items():
+            if sha == ref:
+                targets.add(branch)
+        statuses: dict[str, str] = {}
+        for target in targets:
+            statuses.update(self.commit_statuses.get(target, {}))
         out = []
         for name in sorted(self.required_check_names):
             state = statuses.get(name, "pending")
@@ -445,6 +497,9 @@ class FakeGitHub:
     def has_label(self, name: str) -> bool:
         return name in self.labels
 
+    def rate_limit(self) -> dict:
+        return {"remaining": 5000, "reset": datetime.now(UTC)}
+
     # -- admin protocol ---------------------------------------------------------
 
     def pin_issue(self, number: int, pinned: bool) -> None:
@@ -461,7 +516,23 @@ class FakeGitHub:
         return self._bump_commit(branch)
 
     def get_branch_protection(self, branch: str) -> dict | None:
-        return self.branch_protection.get(branch)
+        raw = self.branch_protection.get(branch)
+        if raw is None:
+            return None
+        require_prs = bool(raw.get("require_prs"))
+        approvals = int(raw.get("require_approvals", 0))
+        checks = list(raw.get("checks") or [])
+        enforce_admins = bool(raw.get("enforce_admins"))
+        return {
+            "require_prs": require_prs,
+            "require_approvals": approvals,
+            "checks": checks,
+            "enforce_admins": enforce_admins,
+            "required_pull_request_reviews": (
+                {"required_approving_review_count": approvals, "enabled": require_prs} if require_prs else None
+            ),
+            "required_status_checks": {"contexts": checks} if require_prs else None,
+        }
 
     def update_branch_protection(
         self,
@@ -474,6 +545,7 @@ class FakeGitHub:
             "require_prs": require_prs,
             "require_approvals": require_approvals,
             "checks": checks or [],
+            "enforce_admins": True,
         }
         self.required_check_names.update(checks or [])
 
@@ -484,8 +556,14 @@ class FakeGitHub:
     def invite_collaborator(self, login: str, permission: str = "push") -> None:
         self.collaborators.add(login)
 
+    def list_collaborators(self) -> list[str]:
+        return sorted(self.collaborators)
+
     def get_authenticated_user(self) -> str:
         return self.actor
+
+    def get_default_branch(self) -> str:
+        return next((b for b in ("main", "master", "dev") if b in self.branches), "main")
 
     # -- observability for tests -------------------------------------------------
 

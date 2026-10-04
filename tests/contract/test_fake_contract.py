@@ -61,6 +61,8 @@ def test_protocol_pr_flow(gh):
     # files list
     gh.prs[pr.number].files = ["src/x.py"]
     assert gh.list_pr_files(pr.number) == ["src/x.py"]
+    # a PR with no approval cannot merge (I-11 §7.4 merge gate)
+    assert gh.merge_pr(pr.number, "squash") is False
     # review
     gh.set_actor("reviewer")
     rv = gh.create_review(
@@ -73,7 +75,7 @@ def test_protocol_pr_flow(gh):
     assert len(gh.pr_reviews(pr.number)) == 1
     comments = gh.list_review_comments(pr.number)
     assert comments[0]["body"] == "please fix" and comments[0]["path"] == "src/x.py"
-    # merge
+    # approved → merge
     merged = gh.merge_pr(pr.number, "squash")
     assert merged is True
     assert gh.get_pr(pr.number).state == "merged"
